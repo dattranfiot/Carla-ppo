@@ -7,9 +7,11 @@ import gym
 import pygame
 from PIL import Image
 from pygame.locals import *
+from CarlaEnv.hud import HUD
+from CarlaEnv.wrappers import *
 
-from hud import HUD
-from wrappers import *
+from agents.navigation.roaming_agent import RoamingAgent
+from agents.navigation.basic_agent import BasicAgent
 
 
 class CarlaDataCollector:
@@ -24,16 +26,24 @@ class CarlaDataCollector:
         in order for this option to work.
     """
 
-    def __init__(self, host="127.0.0.1", port=2000, 
-                 viewer_res=(1280, 720), obs_res=(1280, 720),
-                 num_images_to_save=10000, output_dir="images",
-                 synchronous=True, fps=30, action_smoothing=0.9,
-                 start_carla=True):
+    def __init__(self, host="127.0.0.1",
+                 port=2000,
+                 viewer_res=(1280, 720),
+                 obs_res=(1280, 720),
+                 num_images_to_save=10000,
+                 output_dir="images",
+                 synchronous=True,
+                 fps=30,
+                 action_smoothing=0.0,
+                 start_carla=True,
+                 autopilot=False,
+                 my_map='Town07',
+                 auto_mode=None):
         """
             Initializes an environment that can be used to save camera/sensor data
             from driving around manually in CARLA.
 
-            Connects to a running CARLA enviromment (tested on version 0.9.5) and
+            Connects to a running CARLA enviromment (tested on version 0.9.10) and
             spwans a lincoln mkz2017 passenger car with automatic transmission.
 
             host (string):
@@ -55,7 +65,7 @@ class CarlaDataCollector:
                 1.0 = max smoothing, 0.0 = no smoothing
             fps (int):
                 FPS of the client. If fps <= 0 then use unbounded FPS.
-                Note: Sensors will have a tick rate of fps when fps > 0, 
+                Note: Sensors will have a tick rate of fps when fps > 0,
                 otherwise they will tick as fast as possible.
             synchronous (bool):
                 If True, run in synchronous mode (read the comment above for more info)
@@ -68,30 +78,17 @@ class CarlaDataCollector:
         # Start CARLA from CARLA_ROOT
         self.carla_process = None
         if start_carla:
-            if "CARLA_ROOT" not in os.environ:
-                raise Exception("${CARLA_ROOT} has not been set!")
-            dist_dir = os.path.join(os.environ["CARLA_ROOT"], "Dist")
-            if not os.path.isdir(dist_dir):
-                raise Exception("Expected to find directory \"Dist\" under ${CARLA_ROOT}!")
-            sub_dirs = [os.path.join(dist_dir, sub_dir) for sub_dir in os.listdir(dist_dir) if os.path.isdir(os.path.join(dist_dir, sub_dir))]
-            if len(sub_dirs) == 0:
-                raise Exception("Could not find a packaged distribution of CALRA! " +
-                                "(try building CARLA with the \"make package\" " +
-                                "command in ${CARLA_ROOT})")
-            sub_dir = sub_dirs[0]
-            carla_path = os.path.join(sub_dir, "LinuxNoEditor", "CarlaUE4.sh")
+            carla_path = os.path.join("/opt/carla-simulator/", "CarlaUE4.sh")
             launch_command = [carla_path]
-            launch_command += ["Town07"]
-            if synchronous: launch_command += ["-benchmark"]
+            if synchronous:
+                launch_command += ["-benchmark"]
+
             launch_command += ["-fps=%i" % fps]
             print("Running command:")
             print(" ".join(launch_command))
             self.carla_process = subprocess.Popen(launch_command, stdout=subprocess.PIPE, universal_newlines=True)
-            print("Waiting for CARLA to initialize")
-            for line in self.carla_process.stdout:
-                if "LogCarla: Number Of Vehicles" in line:
-                    break
-            time.sleep(2)
+
+            time.sleep(10)
 
         # Initialize pygame for visualization
         pygame.init()
@@ -103,9 +100,11 @@ class CarlaDataCollector:
             out_width, out_height = obs_res
         self.display = pygame.display.set_mode((width, height), pygame.HWSURFACE | pygame.DOUBLEBUF)
         self.clock = pygame.time.Clock()
+        self._steer_cache = 0
 
         # Setup gym environment
-        self.action_space = gym.spaces.Box(np.array([-1, 0]), np.array([1, 1]), dtype=np.float32) # steer, throttle
+        self.action_space = gym.spaces.Box(np.array([-1, 0, 0, -1]), np.array([1, 1, 1, 1]),
+                                           dtype=np.float32)  # steer, throttle, brake, reverse
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(*obs_res, 3), dtype=np.float32)
         self.fps = fps
         self.spawn_point = 1
@@ -116,9 +115,9 @@ class CarlaDataCollector:
         self.extra_info = []
         self.num_saved_observations = 0
         self.num_images_to_save = num_images_to_save
-        self.observation = {key: None for key in ["rgb", "segmentation"]}        # Last received observations
+        self.observation = {key: None for key in ["rgb", "segmentation"]}  # Last received observations
         self.observation_buffer = {key: None for key in ["rgb", "segmentation"]}
-        self.viewer_image = self.viewer_image_buffer = None                   # Last received image to show in the viewer
+        self.viewer_image = self.viewer_image_buffer = None  # Last received image to show in the viewer
 
         self.output_dir = output_dir
         os.makedirs(os.path.join(self.output_dir, "rgb"))
@@ -131,12 +130,14 @@ class CarlaDataCollector:
             self.client.set_timeout(2.0)
 
             # Create world wrapper
-            self.world = World(self.client)
-
+            self.world = World(self.client, my_map)
+            self.synchronous = synchronous
             # Example: Synchronizing a camera with synchronous mode.
-            settings = self.world.get_settings()
-            settings.synchronous_mode = True
-            self.world.apply_settings(settings)
+            # if synchronous:
+            #     settings = self.world.get_settings()
+            #     settings.synchronous_mode = True
+            #     settings.fixed_delta_seconds = 1 / fps
+            #     self.world.apply_settings(settings)
 
             # Get spawn location
             lap_start_wp = self.world.map.get_waypoint(carla.Location(x=-180.0, y=110))
@@ -156,14 +157,34 @@ class CarlaDataCollector:
             # Create cameras
             self.dashcam_rgb = Camera(self.world, out_width, out_height,
                                       transform=camera_transforms["dashboard"],
-                                      attach_to=self.vehicle, on_recv_image=lambda e: self._set_observation_image("rgb", e))
+                                      attach_to=self.vehicle,
+                                      on_recv_image=lambda e: self._set_observation_image("rgb", e),
+                                      sensor_tick=0.0 if self.synchronous else 1.0 / self.fps)
+
             self.dashcam_seg = Camera(self.world, out_width, out_height,
                                       transform=camera_transforms["dashboard"],
-                                      attach_to=self.vehicle, on_recv_image=lambda e: self._set_observation_image("segmentation", e),
-                                      camera_type="sensor.camera.semantic_segmentation")#, color_converter=carla.ColorConverter.CityScapesPalette)
-            self.camera  = Camera(self.world, width, height,
-                                  transform=camera_transforms["spectator"],
-                                  attach_to=self.vehicle, on_recv_image=lambda e: self._set_viewer_image(e))
+                                      attach_to=self.vehicle,
+                                      on_recv_image=lambda e: self._set_observation_image("segmentation", e),
+                                      camera_type="sensor.camera.semantic_segmentation",
+                                      color_converter=carla.ColorConverter.CityScapesPalette,
+                                      sensor_tick=0.0 if self.synchronous else 1.0 / self.fps)
+            # , color_converter=carla.ColorConverter.CityScapesPalette)
+            self.camera = Camera(self.world, width, height,
+                                 transform=camera_transforms["spectator"],
+                                 attach_to=self.vehicle, on_recv_image=lambda e: self._set_viewer_image(e),
+                                 sensor_tick=0.0 if self.synchronous else 1.0 / self.fps)
+
+            if autopilot and auto_mode is not None and auto_mode == "Roaming":
+                self.agent = RoamingAgent(self.vehicle)
+            elif autopilot and auto_mode is not None and auto_mode == "Basic":
+                self.agent = BasicAgent(self.vehicle)
+                spawn_point = self.world.map.get_spawn_points()[0]
+                self.agent.set_destination((spawn_point.location.x,
+                                            spawn_point.location.y,
+                                            spawn_point.location.z))
+            else:
+                self.agent = None
+
         except Exception as e:
             self.close()
             raise e
@@ -186,11 +207,11 @@ class CarlaDataCollector:
         for i, (_, obs) in enumerate(self.observation.items()):
             obs_h, obs_w = obs.shape[:2]
             view_h, view_w = self.viewer_image.shape[:2]
-            pos = (view_w - obs_w - 10, obs_h * i + 10 * (i+1))
+            pos = (view_w - obs_w - 10, obs_h * i + 10 * (i + 1))
             self.display.blit(pygame.surfarray.make_surface(obs.swapaxes(0, 1)), pos)
 
         # Save current observations
-        if self.recording:
+        if self.recording and self.vehicle.control.brake == 0:
             for obs_type, obs in self.observation.items():
                 img = Image.fromarray(obs)
                 img.save(os.path.join(self.output_dir, obs_type, "{}.png".format(self.num_saved_observations)))
@@ -204,7 +225,7 @@ class CarlaDataCollector:
             "Progress: %.2f%%" % (self.num_saved_observations / self.num_images_to_save * 100.0)
         ])
         self.hud.render(self.display, extra_info=self.extra_info)
-        self.extra_info = [] # Reset extra info list
+        self.extra_info = []  # Reset extra info list
 
         # Render to screen
         pygame.display.flip()
@@ -215,12 +236,20 @@ class CarlaDataCollector:
 
         # Take action
         if action is not None:
-            steer, throttle = [float(a) for a in action]
-            #steer, throttle, brake = [float(a) for a in action]
-            self.vehicle.control.steer    = self.vehicle.control.steer * self.action_smoothing + steer * (1.0-self.action_smoothing)
-            self.vehicle.control.throttle = self.vehicle.control.throttle * self.action_smoothing + throttle * (1.0-self.action_smoothing)
-            #self.vehicle.control.brake = self.vehicle.control.brake * self.action_smoothing + brake * (1.0-self.action_smoothing)
-        
+            # steer, throttle = [float(a) for a in action]
+            # steer, throttle, brake = [float(a) for a in action]
+            steer, throttle, brake, reverse = [float(a) for a in action]
+
+            self.vehicle.control.steer = self.vehicle.control.steer * self.action_smoothing + \
+                                         steer * (1.0 - self.action_smoothing)
+            self.vehicle.control.throttle = self.vehicle.control.throttle * self.action_smoothing + \
+                                            throttle * (1.0 - self.action_smoothing)
+            self.vehicle.control.brake = self.vehicle.control.brake * self.action_smoothing + \
+                                         brake * (1.0 - self.action_smoothing)
+
+            self.vehicle.control.gear = int(reverse)
+            self.vehicle.control.reverse = self.vehicle.control.gear < 0
+
         # Tick game
         self.clock.tick()
         self.hud.tick(self.world, self.clock)
@@ -228,7 +257,7 @@ class CarlaDataCollector:
         try:
             self.world.wait_for_tick(seconds=0.5)
         except RuntimeError as e:
-            pass # Timeouts happen for some reason, however, they are fine to ignore
+            pass  # Timeouts happen for some reason, however, they are fine to ignore
 
         # Get most recent observation and viewer image
         self.observation["rgb"] = self._get_observation("rgb")
@@ -239,8 +268,9 @@ class CarlaDataCollector:
         keys = pygame.key.get_pressed()
         if keys[K_ESCAPE]:
             self.done = True
+
         if keys[K_SPACE]:
-            self.recording = True
+            self.recording = not self.recording
 
     def is_done(self):
         return self.done
@@ -273,10 +303,13 @@ class CarlaDataCollector:
     def _set_viewer_image(self, image):
         self.viewer_image_buffer = image
 
+
 if __name__ == "__main__":
     import argparse
+
     argparser = argparse.ArgumentParser(description="Run this script to drive around with WASD/arrow keys. " +
-                                                    "Press SPACE to start recording RGB and semanting segmentation images from the front facing camera to the disk")
+                                                    "Press SPACE to start recording RGB and semanting segmentation "
+                                                    "images from the front facing camera to the disk")
     argparser.add_argument("--host", default="127.0.0.1", type=str, help="IP of the host server (default: 127.0.0.1)")
     argparser.add_argument("--port", default=2000, type=int, help="TCP port to listen to (default: 2000)")
     argparser.add_argument("--viewer_res", default="1280x720", type=str, help="Window resolution (default: 1280x720)")
@@ -284,8 +317,19 @@ if __name__ == "__main__":
     argparser.add_argument("--output_dir", default="images", type=str, help="Directory to save images to")
     argparser.add_argument("--num_images", default=10000, type=int, help="Number of images to collect")
     argparser.add_argument("--fps", default=30, type=int, help="FPS. Delta time between samples is 1/FPS")
-    argparser.add_argument("--synchronous", type=int, default=True, help="Set this to True when running in a synchronous environment")
-    argparser.add_argument("-start_carla", action="store_true", help="Automatically start CALRA with the given environment settings")
+    argparser.add_argument("--synchronous", type=int, default=True,
+                           help="Set this to True when running in a synchronous environment")
+    argparser.add_argument('-c', '--start_carla',
+                           action="store_true",
+                           help="Automatically start CALRA with the given environment settings")
+    argparser.add_argument('-a', '--autopilot',
+                           action="store_true",
+                           help="enable autopilot")
+    argparser.add_argument("-m", "--mode", type=str,
+                           choices=["Roaming", "Basic"],
+                           help="select which agent to run",
+                           default="Roaming")
+    argparser.add_argument("--my_map", type=str, default="Town07", help="trip settings")
     args = argparser.parse_args()
 
     # Remove existing output directory
@@ -301,29 +345,76 @@ if __name__ == "__main__":
         obs_res = [int(x) for x in args.obs_res.split("x")]
 
     # Create vehicle and actors for data collecting
-    data_collector = CarlaDataCollector(host=args.host, port=args.port,
-                                        viewer_res=viewer_res, obs_res=obs_res, fps=args.fps,
-                                        num_images_to_save=args.num_images, output_dir=args.output_dir,
-                                        synchronous=args.synchronous, start_carla=args.start_carla)
+    data_collector = CarlaDataCollector(host=args.host,
+                                        port=args.port,
+                                        viewer_res=viewer_res,
+                                        obs_res=obs_res,
+                                        fps=args.fps,
+                                        num_images_to_save=args.num_images,
+                                        output_dir=args.output_dir,
+                                        synchronous=args.synchronous,
+                                        start_carla=args.start_carla,
+                                        my_map=args.my_map,
+                                        autopilot=args.autopilot,
+                                        auto_mode=args.mode)
+
     action = np.zeros(data_collector.action_space.shape[0])
 
     # While there are more images to collect
+    throttle = 0
+    brake = 0
+    reverse = 1
+    steer_cache = 0
     while not data_collector.is_done():
-        # Process keyboard input
-        pygame.event.pump()
-        keys = pygame.key.get_pressed()
-        if keys[K_LEFT] or keys[K_a]:
-            action[0] = -0.5
-        elif keys[K_RIGHT] or keys[K_d]:
-            action[0] = 0.5
+        if data_collector.agent is not None:
+            control = data_collector.agent.run_step(debug=True)
+            throttle = control.throttle
+            brake = control.brake
+            steer = control.steer
+            reverse = control.reverse
         else:
-            action[0] = 0.0
-        action[0] = np.clip(action[0], -1, 1)
-        action[1] = 1.0 if keys[K_UP] or keys[K_w] else 0.0
+            # Process keyboard input
+            pygame.event.pump()
+            keys = pygame.key.get_pressed()
+
+            if keys[K_UP] or keys[K_w]:
+                throttle = min(throttle + 0.1, 1)
+            else:
+                throttle = 0.0
+
+            if keys[K_DOWN] or keys[K_s]:
+                brake = min(brake + 0.2, 1)
+            else:
+                brake = 0
+
+            if keys[K_q]:
+                reverse = -1 if reverse > 0 else 1
+
+            steer_increment = 5e-4 * data_collector.clock.get_time()
+            if keys[K_LEFT] or keys[K_a]:
+                if steer_cache > 0:
+                    steer_cache = 0
+                else:
+                    steer_cache -= steer_increment
+            elif keys[K_RIGHT] or keys[K_d]:
+                if steer_cache < 0:
+                    steer_cache = 0
+                else:
+                    steer_cache += steer_increment
+            else:
+                steer_cache = 0.0
+
+            steer_cache = min(0.7, max(-0.7, steer_cache))
+            steer = round(steer_cache, 1)
+
+        action[0] = steer
+        action[1] = throttle
+        action[2] = brake
+        action[3] = reverse
 
         # Take action
         data_collector.step(action)
         data_collector.save_observation()
-        
+
     # Destroy carla actors
     data_collector.close()
